@@ -229,6 +229,57 @@ static char *format_record(const char *csv_line)
     return out;
 }
 
+// ====== Inserta un nuevo par (id, offset) directamente en el índice ======
+static int insert_into_index(uint64_t id, uint64_t offset)
+{
+    unsigned b = hash_id(id);
+    DirEntry *d = &g_dir[b];
+
+    // Cargar el bucket actual
+    if (fseeko(g_idx, (off_t)d->bucket_offset, SEEK_SET) != 0)
+        return -1;
+
+    Pair *pairs = malloc(sizeof(Pair) * (d->bucket_count + 1));
+    if (!pairs)
+        return -1;
+
+    size_t rd = fread(pairs, sizeof(Pair), (size_t)d->bucket_count, g_idx);
+    if (rd != (size_t)d->bucket_count && ferror(g_idx))
+    {
+        free(pairs);
+        return -1;
+    }
+
+    // Insertar manteniendo orden por id
+    size_t i = 0;
+    while (i < d->bucket_count && pairs[i].id < id)
+        i++;
+    memmove(&pairs[i + 1], &pairs[i], (d->bucket_count - i) * sizeof(Pair));
+    pairs[i].id = id;
+    pairs[i].offset = offset;
+    d->bucket_count++;
+
+    // Escribir nuevo bloque al final del archivo
+    fseeko(g_idx, 0, SEEK_END);
+    d->bucket_offset = (uint64_t)ftello(g_idx);
+    fwrite(pairs, sizeof(Pair), d->bucket_count, g_idx);
+    fflush(g_idx);
+    free(pairs);
+
+    // Actualizar el directorio
+    fseeko(g_idx, sizeof(Header) + (b * sizeof(DirEntry)), SEEK_SET);
+    fwrite(d, sizeof(DirEntry), 1, g_idx);
+    fflush(g_idx);
+
+    // Actualizar el header (total_entries)
+    g_hdr.total_entries++;
+    fseeko(g_idx, 0, SEEK_SET);
+    fwrite(&g_hdr, sizeof(Header), 1, g_idx);
+    fflush(g_idx);
+
+    return 0;
+}
+
 // ====== Hilo por conexión ======
 typedef struct
 {
@@ -257,9 +308,67 @@ static void *client_thread(void *arg)
 
         if (strcasecmp(line, "QUIT") == 0)
             break;
-        if (strncasecmp(line, "GET ", 4) != 0)
+        if (strncasecmp(line, "ADD ", 4) == 0)
         {
-            const char *msg = "ERR expected: GET <id>\\n or QUIT\\n";
+            // 1. Extraer línea CSV completa
+            const char *csv_line = line + 4;
+            while (*csv_line == ' ')
+                csv_line++;
+
+            // 2. Extraer el ID inicial
+            char idbuf[32];
+            const char *comma = strchr(csv_line, ',');
+            if (!comma)
+            {
+                const char *msg = "ERR formato CSV inválido\n";
+                send(fd, msg, strlen(msg), 0);
+                continue;
+            }
+            size_t len = comma - csv_line;
+            if (len >= sizeof(idbuf))
+                len = sizeof(idbuf) - 1;
+            memcpy(idbuf, csv_line, len);
+            idbuf[len] = '\0';
+            uint64_t id = strtoull(idbuf, NULL, 10);
+
+            // 3. Verificar si el ID ya existe
+            uint64_t off_exist = 0;
+            int exists = find_offset(id, &off_exist);
+            if (exists < 0)
+            {
+                const char *msg = "ERR index read error\n";
+                send(fd, msg, strlen(msg), 0);
+                continue;
+            }
+            if (exists > 0)
+            {
+                const char *msg = "ERR ID duplicado\n";
+                send(fd, msg, strlen(msg), 0);
+                continue;
+            }
+
+            // 4. Escribir la nueva línea al final del CSV
+            fseeko(g_csv, 0, SEEK_END);
+            uint64_t offset = (uint64_t)ftello(g_csv);
+            fprintf(g_csv, "%s\n", csv_line);
+            fflush(g_csv);
+
+            // 5. Insertar en el índice binario
+            if (insert_into_index(id, offset) != 0)
+            {
+                const char *msg = "ERR inserción en índice\n";
+                send(fd, msg, strlen(msg), 0);
+                continue;
+            }
+
+            // 6. Confirmar al cliente
+            const char *okmsg = "OK Registro agregado correctamente\n";
+            send(fd, okmsg, strlen(okmsg), 0);
+            continue;
+        }
+        else if (strncasecmp(line, "GET ", 4) != 0)
+        {
+            const char *msg = "ERR expected: GET <id> or ADD <csv>\n";
             send(fd, msg, strlen(msg), 0);
             send(fd, "\n", 1, 0);
             continue;
@@ -348,13 +457,14 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_sigint);
 
     // Abrir índice y CSV
-    g_idx = fopen(idx_path, "rb");
+    g_idx = fopen(idx_path, "r+b"); // lectura/escritura binaria
     if (!g_idx)
     {
         perror("open idx");
         return EXIT_FAILURE;
     }
-    g_csv = fopen(csv_path, "rb");
+
+    g_csv = fopen(csv_path, "a+b"); // append + lectura
     if (!g_csv)
     {
         perror("open csv");

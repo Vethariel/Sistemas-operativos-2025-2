@@ -4,8 +4,8 @@
 
 # Compilador y flags
 CC      := gcc
-CFLAGS  := -O2 -std=c11 -Wall -Wextra -D_FILE_OFFSET_BITS=64 -pthread
-LDFLAGS := 
+CFLAGS  := -O2 -std=gnu11 -Wall -Wextra -D_FILE_OFFSET_BITS=64 -D_POSIX_C_SOURCE=200809L -pthread
+LDFLAGS := -pthread
 
 # Archivos fuente
 SRC_INDEX   := build_index.c
